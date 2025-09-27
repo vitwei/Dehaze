@@ -10,7 +10,6 @@ import torchvision.transforms as transforms
 import torch.optim
 import argparse
 import ipdb
-import dataloader_prompt_margin
 import dataloader_prompt_add
 import dataloader_images as dataloader_sharp 
 import copy
@@ -82,8 +81,11 @@ def train(config):
 
 
     if config.load_pretrain_prompt == True:
-        ck=torch.load('/home/huangweiyan/workspace/model/CLIP-LIT/train1/snapshots_prompt_train1/best_prompt_round0.pth', map_location='cpu')
-        model.prompt.load_state_dict(ck,strict=False)
+        promptck=torch.load('/home/huangweiyan/workspace/model/CLIP-LIT/train1/snapshots_prompt_train1/best_prompt_round0.pth', map_location='cpu')
+        model.prompt.load_state_dict(promptck,strict=False)
+        if config.load_pretrain_syn_finetune == True:
+                promptck=torch.load('/home/huangweiyan/workspace/model/CLIP-LIT/train1/snapshots_prompt_train1/best_syn_round0syn_finetune.pth', map_location='cpu')
+                model.syn.load_state_dict(promptck,strict=False)
         torch.save(model.prompt.state_dict(), config.prompt_snapshots_folder + "pretrained_prompt" + '.pth')
         if config.train_syn:
             config.num_clip_pretrained_iters=5000
@@ -96,8 +98,8 @@ def train(config):
     train_norm_dataset = dataloader_sharp.PairedImageDataset(config.normallight_images_path,512)    #dataloader
     train_norm_loader = torch.utils.data.DataLoader(train_norm_dataset, batch_size=config.train_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
     
-    prompt_train_dataset = dataloader_prompt_margin.lowlight_loader(config.lowlight_images_path,config.normallight_images_path)#,config.overlight_images_path)        
-    prompt_train_loader = torch.utils.data.DataLoader(prompt_train_dataset, batch_size=config.prompt_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
+    syn_train_dataset = dataloader_prompt_add.synhaze_loader("/home/huangweiyan/workspace/dataset/DenseHaze/negative","/home/huangweiyan/workspace/dataset/DenseHaze/positive")#,config.overlight_images_path)        
+    syn_train_loader = torch.utils.data.DataLoader(syn_train_dataset, batch_size=8, shuffle=True, num_workers=config.num_workers, pin_memory=True)
     
     prompt_train_dataset_1 = dataloader_prompt_add.lowlight_loader(config.overlight_images_path,config.normallight_images_path)
     prompt_train_loader_1 = torch.utils.data.DataLoader(prompt_train_dataset_1, batch_size=config.prompt_batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True,drop_last=True )
@@ -123,6 +125,8 @@ def train(config):
     semi_path=['','']
     pr_semi_path=0
 
+    haze_train=0
+    haze_iteration=0
     best_model=model
     best_syn=model.syn
     min_prompt_loss=100
@@ -134,12 +138,15 @@ def train(config):
     reconstruction_iter=0
     reinit_flag=0
     #Start training!
+    train_syn=False
     for epoch in range(config.num_epochs):
         if total_iteration<config.num_clip_pretrained_iters:
-            if config.train_syn==True:
+            if config.train_syn==True and train_syn==False:
                 total_iteration=2000
+                cur_iteration=2000
                 train_thre=0
                 total_thre=config.num_clip_pretrained_iters
+                train_syn=True
             else:
                 train_thre=0
                 total_thre=config.num_clip_pretrained_iters
@@ -147,8 +154,8 @@ def train(config):
             train_thre=config.num_reconstruction_iters
             total_thre=config.num_reconstruction_iters
         elif cur_iteration==0:
-            train_thre=5000#800#2100#800#200
-            total_thre=6100#2800#3100#1200#500
+            train_thre=200000#800#2100#800#200
+            total_thre=261000#2800#3100#1200#500
             print("cur using prompt from: iteration ", best_prompt_iter)
             print("cur using best model from: iteration ", best_model_iter)
             print("cur using best model from: iteration ", best_syn_iter)
@@ -222,59 +229,108 @@ def train(config):
         else:
             #prompt initialization
             if total_iteration<config.num_clip_pretrained_iters:
-                for iteration, item in enumerate(prompt_train_loader_1):
-                    img_lowlight,label,img_lowlight_tensor=item    
-                    img_lowlight = img_lowlight.cuda()
-                    label = label.cuda()
-                    img_lowlight_tensor=img_lowlight_tensor.squeeze(1).cuda()
-                    if total_iteration>2000:
-                        model.prompt.embedding_prompt.requires_grad =False      
+                if total_iteration>=2000:
+                    if haze_train<2000:
+                        for iteration, item in enumerate(syn_train_loader):
+                            haze,dehaze=item    
+                            model.prompt.embedding_prompt.requires_grad =False
+                            haze=haze.cuda()
+                            dehaze=dehaze.cuda()      
+                            _,_,syn=model(dehaze)
 
-                        _,_,syn=model(img_lowlight_tensor)
-                        clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
-                                                device=syn.device).view(1, 3, 1, 1)
-                        clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711],
-                                                device=syn.device).view(1, 3, 1, 1)
-                        syn_mean = (syn - clip_mean) / clip_std   
-                        syn_resized = resize_to_multiple_of(syn, 14)
-                        syn_gt_resized = resize_to_multiple_of(img_lowlight_tensor, 14)
+                            syn_resized = resize_to_multiple_of(syn, 14)
+                            syn_gt_resized = resize_to_multiple_of(dehaze, 14)
 
-                        depthloss=F.l1_loss(Depth(syn_resized),Depth(syn_gt_resized))
+                            depthloss=F.l1_loss(Depth(syn_resized),Depth(syn_gt_resized))
 
-                        syn_features = clipmodel.encode_image(syn_mean)
-                        syn_features = syn_features / (syn_features.norm(dim=-1, keepdim=True) + 1e-6)
-                        syn_output=model.prompt(syn_features,0)
+                            syn_loss=0.5*depthloss+F.mse_loss(haze,syn)
 
-                        syn_cross_entropyloss=F.cross_entropy(syn_output,torch.from_numpy(np.array(0)).cuda())
-                        syn_loss=depthloss+syn_cross_entropyloss
+                            train_syn_optimizer.zero_grad()
+                            syn_loss.backward()
+                            train_syn_optimizer.step()
+                            if ((haze_train+1) % config.prompt_display_iter) == 0:
+                                if syn_loss<min_syn_loss:
+                                    min_syn_loss=syn_loss
+                                    best_syn=model.syn
+                                    best_syn_iter=haze_train+1
+                                    torch.save(best_syn.state_dict(), config.prompt_snapshots_folder + "best_syn_round"+str(rounds) + 'haze.pth')
+                                print("Loss at iteration", haze_train+1, ":", syn_loss.item())
+                                print("loss",syn_loss)
+                                writer.add_scalars('Loss_syn', {'train':syn_loss}, haze_train)
+                                idx = random.randint(0, syn.size(0) - 1) 
+                                writer.add_image("syn_haze", syn[idx],haze_train)
+                                print(haze_train+1," ",2000)
+                            if ((haze_train+1) % config.prompt_snapshot_iter) == 0:
+                                torch.save(model.syn.state_dict(), config.prompt_snapshots_folder + "iter_" + str(haze_train+1) + 'haze.pth')  
+                            haze_train+=1
+                    min_syn_loss=100
+                    if haze_train>2000:
+                        for iteration, item in enumerate(prompt_train_loader_1):
+                            img_lowlight,label,img_lowlight_tensor=item       
+                            model.prompt.embedding_prompt.requires_grad =False
+                            mark = (label == 1)    # [bs] 布尔张量 True/False
+                            img_selected = img_lowlight_tensor[mark]
+                            img_selected=img_selected.cuda()      
+                            _,_,syn=model(img_selected)
 
-                        train_syn_optimizer.zero_grad()
-                        syn_loss.backward()
-                        train_syn_optimizer.step()
-                        loss=syn_loss
-                        if ((total_iteration+1) % config.prompt_display_iter) == 0:
-                            if loss<min_syn_loss:
-                                min_syn_loss=loss
-                                best_syn=model.syn
-                                best_syn_iter=total_iteration+1
-                                torch.save(best_syn.state_dict(), config.prompt_snapshots_folder + "best_syn_round"+str(rounds) + '.pth')
-                            print("prompt current learning rate: ",train_syn_optimizer.state_dict()['param_groups'][0]['lr'])
-                            print("Loss at iteration", total_iteration+1, ":", syn_loss.item())
-                            print("loss",syn_loss)
-                            writer.add_scalars('Loss_syn', {'train':syn_loss}, total_iteration)
-                            writer.add_scalars('Loss_syn_cross', {'train':syn_cross_entropyloss}, total_iteration)
-                            idx = random.randint(0, syn.size(0) - 1) 
-                            writer.add_image("syn_Sample_prompt", syn[idx],total_iteration)
-                            print(cur_iteration+1," ",total_iteration+1)
-                            print(train_thre,' ',total_thre)
+                            clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073],
+                                                    device=syn.device).view(1, 3, 1, 1)
+                            clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                                                    device=syn.device).view(1, 3, 1, 1)
+                            syn_mean = (syn - clip_mean) / clip_std   
+                            syn_resized = resize_to_multiple_of(syn, 14)
+                            syn_gt_resized = resize_to_multiple_of(img_selected, 14)
 
-                    if total_iteration<2000:
+                            depthloss=F.l1_loss(Depth(syn_resized),Depth(syn_gt_resized))
+
+                            syn_features = clipmodel.encode_image(syn_mean)
+                            syn_features = syn_features / (syn_features.norm(dim=-1, keepdim=True) + 1e-6)
+                            syn_output=model.prompt(syn_features,0)
+
+                            syn_cross_entropyloss=F.cross_entropy(syn_output,torch.from_numpy(np.array(0)).cuda())
+                            syn_loss=depthloss+syn_cross_entropyloss
+
+                            train_syn_optimizer.zero_grad()
+                            syn_loss.backward()
+                            train_syn_optimizer.step()
+                            loss=syn_loss
+                            if ((total_iteration+1) % config.prompt_display_iter) == 0:
+                                if loss<min_syn_loss:
+                                    min_syn_loss=loss
+                                    best_syn=model.syn
+                                    best_syn_iter=total_iteration+1
+                                    torch.save(best_syn.state_dict(), config.prompt_snapshots_folder + "best_syn_round"+str(rounds) + 'syn_finetune.pth')
+                                print("prompt current learning rate: ",train_syn_optimizer.state_dict()['param_groups'][0]['lr'])
+                                print("Loss at iteration", total_iteration+1, ":", syn_loss.item())
+                                print("loss",syn_loss)
+                                writer.add_scalars('Loss_syn', {'train':syn_loss}, total_iteration)
+                                writer.add_scalars('Loss_syn_cross', {'train':syn_cross_entropyloss}, total_iteration)
+                                idx = random.randint(0, syn.size(0) - 1) 
+                                writer.add_image("syn_Sample_prompt", syn[idx],total_iteration)
+                                print(cur_iteration+1," ",total_iteration+1)
+                                print(train_thre,' ',total_thre)
+                            if ((total_iteration+1) % config.prompt_snapshot_iter) == 0:
+                                torch.save(model.syn.state_dict(), config.prompt_snapshots_folder + "iter_" + str(total_iteration+1) + 'syn_finetune.pth')  
+                            if cur_iteration+1==total_thre and loss>config.thre_prompt:#loss>last_prompt_loss[flag_prompt]*0.95:#loss>0.01:#
+                                #train_thre+=20
+                                total_thre+=100
+                            elif cur_iteration+1==total_thre:
+                                cur_iteration+=1
+                                total_iteration+=1
+                                break
+                            cur_iteration+=1
+                            total_iteration+=1  
+                if total_iteration<2000:
+                    for iteration, item in enumerate(prompt_train_loader_1):
+                        img_lowlight,label,img_lowlight_tensor=item    
+                        img_lowlight = img_lowlight.cuda()
+                        label = label.cuda()
+                        img_lowlight_tensor=img_lowlight_tensor.squeeze(1).cuda()
+
                         model.prompt.embedding_prompt.requires_grad =True 
-
                         output = model.prompt(img_lowlight, 0) 
                         cross_entropyloss=  F.cross_entropy(output,label)
                         prompt_loss=cross_entropyloss
-
                         train_prompt_optimizer.zero_grad()
                         prompt_loss.backward()
                         train_prompt_optimizer.step()
@@ -293,18 +349,20 @@ def train(config):
                             writer.add_scalars('Loss_prompt', {'train':loss}, total_iteration)
                             print(cur_iteration+1," ",total_iteration+1)
                             print(train_thre,' ',total_thre)
-                            
-                    if ((total_iteration+1) % config.prompt_snapshot_iter) == 0:
-                        torch.save(model.prompt.state_dict(), config.prompt_snapshots_folder + "iter_" + str(total_iteration+1) + '.pth')  
-                    if cur_iteration+1==total_thre and loss>config.thre_prompt:#loss>last_prompt_loss[flag_prompt]*0.95:#loss>0.01:#
-                        #train_thre+=20
-                        total_thre+=100
-                    elif cur_iteration+1==total_thre:
+                        if ((total_iteration+1) % config.prompt_snapshot_iter) == 0:
+                            torch.save(model.prompt.state_dict(), config.prompt_snapshots_folder + "iter_" + str(total_iteration+1) + '.pth')  
+                        if cur_iteration+1==total_thre and loss>config.thre_prompt:#loss>last_prompt_loss[flag_prompt]*0.95:#loss>0.01:#
+                            #train_thre+=20
+                            total_thre+=100
+                        elif cur_iteration+1==total_thre:
+                            cur_iteration+=1
+                            total_iteration+=1
+                            break
                         cur_iteration+=1
-                        total_iteration+=1
-                        break
-                    cur_iteration+=1
-                    total_iteration+=1  
+                        total_iteration+=1  
+
+
+
             
 
 if __name__ == "__main__": 
@@ -343,9 +401,9 @@ if __name__ == "__main__":
     parser.add_argument('--load_pretrain', type=lambda x: (str(x).lower() == 'true'), default= False)
     parser.add_argument('--pretrain_dir', type=str, default= './pretrained_models/init_pretrained_models/init_enhancement_model.pth')
     parser.add_argument('--load_pretrain_prompt', type=lambda x: (str(x).lower() == 'true'), default= True)
-    parser.add_argument('--train_syn', type=lambda x: (str(x).lower() == 'true'), default= True)
-    parser.add_argument('--prompt_pretrain_dir', type=str, default= './pretrained_models/init_pretrained_models/best_prompt_round0.pth')
-    
+    parser.add_argument('--train_syn', type=lambda x: (str(x).lower() == 'true'), default= False)
+    parser.add_argument('--prompt_pretrain_dir', type=str, default= './pretrained_models/init_pretrained_models/iter_3300.pth')
+    parser.add_argument('--load_pretrain_syn_finetune', type=lambda x: (str(x).lower() == 'true'), default= True)
     config = parser.parse_args()
 
     if not os.path.exists(config.train_snapshots_folder):

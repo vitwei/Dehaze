@@ -182,4 +182,47 @@ class lowlight_loader(data.Dataset):
 
 	def __len__(self):
 		return len(self.data_list)
+	
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in [".bmp", ".png", ".jpg", ".jpeg"])
+
+class synhaze_loader(data.Dataset):
+	def __init__(self, lowlight_images_path,normallight_images_path):
+		self.hr_image_filenames = [os.path.join(normallight_images_path, x) for x in os.listdir(normallight_images_path) if is_image_file(x)]
+		self.lr_image_filenames = [os.path.join(lowlight_images_path, x) for x in os.listdir(normallight_images_path) if is_image_file(x)]
+		self.size = 256
+		assert len(self.lr_image_filenames)==len(self.hr_image_filenames)
+
+
+		
+
+	def __getitem__(self, index):
+		low_path = self.lr_image_filenames[index]
+		high_path = self.hr_image_filenames[index]
+		data_haze = Image.open(low_path)
+		data_dehaze = Image.open(high_path)
+		
+		data_haze = data_haze.resize((self.size,self.size), Image.Resampling.LANCZOS)
+		data_dehaze = data_dehaze.resize((self.size,self.size), Image.Resampling.LANCZOS)
+		data_haze,data_dehaze=preprocess_aug(data_haze,data_dehaze)
+		
+		data_haze = (np.asarray(data_haze)/255.0) 
+		data_haze = torch.from_numpy(data_haze).float()
+		data_haze=data_haze.permute(2,0,1).to(device)
+
+		data_dehaze = (np.asarray(data_dehaze)/255.0) 
+		data_dehaze = torch.from_numpy(data_dehaze).float()
+		data_dehaze=data_dehaze.permute(2,0,1).to(device)
+
+		img_resize = transforms.Resize((224,224))
+
+		image_haze=img_resize(data_haze)
+		image_dehaze=img_resize(data_dehaze)
+
+
+	
+		return image_haze,image_dehaze
+
+	def __len__(self):
+		return len(self.hr_image_filenames)
 
